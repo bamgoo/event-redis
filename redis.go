@@ -30,9 +30,12 @@ type (
 		pubsubs map[string]struct{}
 		streams map[string]string
 
-		subs []*redis.PubSub
-		done chan struct{}
-		wg   sync.WaitGroup
+		subs        []*redis.PubSub
+		done        chan struct{}
+		root        context.Context
+		stop        context.CancelFunc
+		wg          sync.WaitGroup
+		retryTokens chan struct{}
 	}
 
 	syncInstance interface {
@@ -46,7 +49,9 @@ type (
 		Batch       int64
 		MaxAttempts int
 		RetryDelay  time.Duration
+		RetryLimit  int
 		DeadLetter  string
+		TrimMaxLen  int64
 	}
 )
 
@@ -102,6 +107,8 @@ func (d *redisDriver) Connect(inst *event.Instance) (event.Connection, error) {
 		}
 	}
 
+	root, stop := context.WithCancel(context.Background())
+
 	return &redisConnection{
 		instance: inst,
 		setting:  redisCfg,
@@ -111,9 +118,12 @@ func (d *redisDriver) Connect(inst *event.Instance) (event.Connection, error) {
 			Password: password,
 			DB:       database,
 		}),
-		pubsubs: make(map[string]struct{}, 0),
-		streams: make(map[string]string, 0),
-		done:    make(chan struct{}),
+		pubsubs:     make(map[string]struct{}, 0),
+		streams:     make(map[string]string, 0),
+		done:        make(chan struct{}),
+		root:        root,
+		stop:        stop,
+		retryTokens: makeRetryTokens(redisCfg.RetryLimit),
 	}, nil
 }
 
@@ -257,10 +267,12 @@ func (c *redisConnection) Stop() error {
 	}
 
 	close(c.done)
+	c.stop()
 	for _, sub := range c.subs {
 		_ = sub.Close()
 	}
 	c.wg.Wait()
+	c.root, c.stop = context.WithCancel(context.Background())
 	c.subs = nil
 	c.done = make(chan struct{})
 	c.running = false
@@ -269,22 +281,26 @@ func (c *redisConnection) Stop() error {
 
 func (c *redisConnection) Publish(name string, data []byte) error {
 	if c.isPublishSubject(name) {
+		stream := streamKey(name)
 		ctx, cancel := context.WithTimeout(context.Background(), c.setting.Timeout)
 		defer cancel()
 		_, err := c.client.XAdd(ctx, &redis.XAddArgs{
-			Stream: streamKey(name),
+			Stream: stream,
 			Values: map[string]any{
 				"data":    string(data),
 				"attempt": 1,
 			},
 		}).Result()
-		c.trace("publish", name, err, map[string]any{"driver": "redis", "stream": streamKey(name)})
+		if err == nil {
+			c.trimStream(stream)
+		}
+		c.trace("publish", name, err, map[string]any{"driver": "redis", "stream": stream, "bytes": len(data)})
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.setting.Timeout)
 	defer cancel()
 	err := c.client.Publish(ctx, name, data).Err()
-	c.trace("publish", name, err, map[string]any{"driver": "redis"})
+	c.trace("publish", name, err, map[string]any{"driver": "redis", "bytes": len(data)})
 	return err
 }
 
@@ -298,7 +314,7 @@ func (c *redisConnection) handleStreamMessages(streamName, groupName string, mes
 		eventName := subjectFromStream(streamName)
 		if serveEvent(c.instance, eventName, []byte(raw)) {
 			c.ackStreamMessage(streamName, groupName, msg.ID)
-			c.trace("ack", eventName, nil, map[string]any{"driver": "redis", "stream": streamName, "message": msg.ID})
+			c.trace("ack", eventName, nil, map[string]any{"driver": "redis", "stream": streamName, "message": msg.ID, "attempt": streamAttempt(msg), "bytes": len(raw)})
 		} else {
 			c.handleFailedStreamMessage(streamName, groupName, msg)
 		}
@@ -320,6 +336,7 @@ func (c *redisConnection) handleFailedStreamMessage(streamName, groupName string
 		c.trace("dead_letter", eventName, err, map[string]any{"driver": "redis", "stream": streamName, "message": msg.ID, "attempt": attempt})
 		if err == nil {
 			c.ackStreamMessage(streamName, groupName, msg.ID)
+			c.trimStream(streamName)
 		}
 		return
 	}
@@ -330,13 +347,9 @@ func (c *redisConnection) handleFailedStreamMessage(streamName, groupName string
 	}
 
 	if c.setting.RetryDelay > 0 {
-		timer := time.NewTimer(c.setting.RetryDelay)
-		select {
-		case <-c.done:
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
+		c.scheduleRetry(streamName, groupName, msg, attempt+1)
+		c.trace("retry", eventName, nil, map[string]any{"driver": "redis", "stream": streamName, "message": msg.ID, "attempt": attempt + 1, "delay": c.setting.RetryDelay.String()})
+		return
 	}
 
 	err := c.requeueStreamMessage(streamName, msg, attempt+1)
@@ -344,6 +357,36 @@ func (c *redisConnection) handleFailedStreamMessage(streamName, groupName string
 	if err == nil {
 		c.ackStreamMessage(streamName, groupName, msg.ID)
 	}
+}
+
+func (c *redisConnection) scheduleRetry(streamName, groupName string, msg redis.XMessage, attempt int) {
+	if c.retryTokens != nil {
+		select {
+		case c.retryTokens <- struct{}{}:
+		default:
+			c.trace("retry_limited", subjectFromStream(streamName), nil, map[string]any{"driver": "redis", "stream": streamName, "message": msg.ID, "attempt": attempt})
+			return
+		}
+	}
+	c.wg.Add(1)
+	timer := time.NewTimer(c.setting.RetryDelay)
+	go func() {
+		defer c.wg.Done()
+		defer timer.Stop()
+		if c.retryTokens != nil {
+			defer func() { <-c.retryTokens }()
+		}
+		select {
+		case <-c.done:
+			return
+		case <-timer.C:
+		}
+		err := c.requeueStreamMessage(streamName, msg, attempt)
+		c.trace("retry_publish", subjectFromStream(streamName), err, map[string]any{"driver": "redis", "stream": streamName, "message": msg.ID, "attempt": attempt})
+		if err == nil {
+			c.ackStreamMessage(streamName, groupName, msg.ID)
+		}
+	}()
 }
 
 func (c *redisConnection) requeueStreamMessage(streamName string, msg redis.XMessage, attempt int) error {
@@ -360,6 +403,9 @@ func (c *redisConnection) requeueStreamMessage(streamName string, msg redis.XMes
 			"attempt": attempt,
 		},
 	}).Result()
+	if err == nil {
+		c.trimStream(streamName)
+	}
 	return err
 }
 
@@ -371,8 +417,9 @@ func (c *redisConnection) publishDeadLetter(streamName string, msg redis.XMessag
 	subject := subjectFromStream(streamName)
 	ctx, cancel := context.WithTimeout(context.Background(), c.setting.Timeout)
 	defer cancel()
+	dlq := deadLetterStream(c.setting.DeadLetter, subject)
 	_, err := c.client.XAdd(ctx, &redis.XAddArgs{
-		Stream: deadLetterStream(c.setting.DeadLetter, subject),
+		Stream: dlq,
 		Values: map[string]any{
 			"data":     raw,
 			"subject":  subject,
@@ -383,20 +430,23 @@ func (c *redisConnection) publishDeadLetter(streamName string, msg redis.XMessag
 			"datetime": time.Now().Unix(),
 		},
 	}).Result()
+	if err == nil {
+		c.trimStream(dlq)
+	}
 	return err
 }
 
-func (c *redisConnection) readContext() (context.Context, context.CancelFunc) {
+func (c *redisConnection) trimStream(streamName string) {
+	if c.setting.TrimMaxLen <= 0 {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.setting.Timeout)
-	done := c.done
-	go func() {
-		select {
-		case <-done:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
-	return ctx, cancel
+	defer cancel()
+	_ = c.client.XTrimMaxLenApprox(ctx, streamName, c.setting.TrimMaxLen, 0).Err()
+}
+
+func (c *redisConnection) readContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(c.root, c.setting.Timeout)
 }
 
 func (c *redisConnection) trace(operation, name string, err error, attrs map[string]any) {
@@ -480,8 +530,17 @@ func parseRedisSetting(setting map[string]any) redisSetting {
 		Batch:       int64Setting(setting, "batch", redisDefaultBatchSize),
 		MaxAttempts: intSetting(setting, "max_attempts", 0),
 		RetryDelay:  durationSetting(setting, "retry_delay", 0),
+		RetryLimit:  intSetting(setting, "retry_limit", 1024),
 		DeadLetter:  stringSetting(setting, "dead_letter", redisDefaultDeadLetter),
+		TrimMaxLen:  int64Setting(setting, "trim_max_len", 0),
 	}
+}
+
+func makeRetryTokens(limit int) chan struct{} {
+	if limit <= 0 {
+		return nil
+	}
+	return make(chan struct{}, limit)
 }
 
 func durationSetting(setting map[string]any, key string, def time.Duration) time.Duration {
